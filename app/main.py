@@ -9,6 +9,7 @@ from PySide6.QtGui import QIcon
 import cv2
 from PySide6 import QtCore, QtGui, QtWidgets
 
+# --- 依赖库导入检查 ---
 MP_IMPORT_ERROR = ""
 try:
     import mediapipe as mp
@@ -27,16 +28,20 @@ except ImportError:
     pyttsx3 = None
 
 
+# --- 配置数据类 ---
 @dataclass
 class AppConfig:
-    minutes: int = 20
-    seconds: int = 0
+    focus_minutes: int = 25  # 专注时长
+    focus_seconds: int = 0
+    break_minutes: int = 5  # 休息时长
+    break_seconds: int = 0  # 休息秒数
     prompt_text: str = "请停止玩手机，专注一下吧。"
     prompt_cooldown: int = 10
     enable_monitor: bool = True
     yolo_weights_path: str = "models/yolo11n.pt"
 
 
+# --- 悬浮窗组件 ---
 class FloatingTimer(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
@@ -55,12 +60,20 @@ class FloatingTimer(QtWidgets.QWidget):
         font = QtGui.QFont("Arial", 28, QtGui.QFont.Bold)
         self.label.setFont(font)
 
+        # 状态标签 (显示 "专注中" 或 "休息中")
+        self.status_label = QtWidgets.QLabel("", self)
+        self.status_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.status_label.setGeometry(0, 65, 240, 20)
+        self.status_label.setStyleSheet("color: #8a5a3a; font-size: 12px; font-weight: bold;")
+
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.addWidget(self.label)
 
-    def update_time(self, text: str) -> None:
+    def update_time(self, text: str, status_text: str = "") -> None:
         self.label.setText(text)
+        if status_text:
+            self.status_label.setText(status_text)
 
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
@@ -88,11 +101,11 @@ class FloatingTimer(QtWidgets.QWidget):
         event.accept()
 
 
+# --- 语音播报组件 ---
 class VoicePrompter(QtCore.QObject):
     def __init__(self):
         super().__init__()
         self._engine = None
-        # Windows 初始化
         if platform.system() == "Windows":
             if pyttsx3:
                 try:
@@ -103,45 +116,55 @@ class VoicePrompter(QtCore.QObject):
     def speak(self, text: str) -> None:
         print(f"[语音调试] 尝试播放: {text}")
 
-        # Mac 走系统命令
         if platform.system() == "Darwin":
             os.system(f'say "{text}" &')
             return
 
-        # Windows 走 pyttsx3
         if self._engine:
             def _worker():
                 self._engine.say(text)
                 self._engine.runAndWait()
+
             threading.Thread(target=_worker, daemon=True).start()
 
+
+# --- 带加减按钮的输入框 ---
 class SpinBoxWithButtons(QtWidgets.QWidget):
     valueChanged = QtCore.Signal(int)
 
     def __init__(self, minimum: int, maximum: int, value: int, suffix: str):
         super().__init__()
+        # 关键修复：显式设置最小高度，防止在FormLayout中被压缩
+        self.setMinimumHeight(40)
+
         self.spin = QtWidgets.QSpinBox()
         self.spin.setRange(minimum, maximum)
         self.spin.setValue(value)
         self.spin.setSuffix(suffix)
         self.spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
+        # 让内部SpinBox自适应宽度
+        self.spin.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
 
         self.plus_btn = QtWidgets.QToolButton()
         self.plus_btn.setText("+")
         self.minus_btn = QtWidgets.QToolButton()
         self.minus_btn.setText("-")
+        # 按钮稍微大一点点，方便点击
+        self.plus_btn.setFixedSize(20, 18)
+        self.minus_btn.setFixedSize(20, 18)
+
         self.plus_btn.clicked.connect(self.spin.stepUp)
         self.minus_btn.clicked.connect(self.spin.stepDown)
         self.spin.valueChanged.connect(self.valueChanged.emit)
 
         btn_layout = QtWidgets.QVBoxLayout()
-        btn_layout.setSpacing(2)
+        btn_layout.setSpacing(0)
         btn_layout.setContentsMargins(0, 0, 0, 0)
         btn_layout.addWidget(self.plus_btn)
         btn_layout.addWidget(self.minus_btn)
 
         layout = QtWidgets.QHBoxLayout(self)
-        layout.setSpacing(6)
+        layout.setSpacing(4)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.spin)
         layout.addLayout(btn_layout)
@@ -152,10 +175,11 @@ class SpinBoxWithButtons(QtWidgets.QWidget):
     def setValue(self, value: int) -> None:
         self.spin.setValue(value)
 
-    def setFixedWidth(self, width: int) -> None:
-        self.spin.setFixedWidth(width)
+    # 移除了 setFixedWidth 的重写，让 QWidget 默认行为生效，
+    # 这样 MainWindow 里的 setFixedWidth 就会作用于整个容器，避免布局错乱。
 
 
+# --- 摄像头监测线程 ---
 class CameraMonitor(QtCore.QThread):
     prompt_needed = QtCore.Signal(str)
     status = QtCore.Signal(str)
@@ -220,6 +244,7 @@ class CameraMonitor(QtCore.QThread):
         if denom <= 0:
             return False
         ratio = (nose.y - eye_mid_y) / denom
+        print(f"[调试] 低头系数: {ratio:.3f} (当前阈值: 0.45)")
         return ratio > 0.45
 
     def _phone_detected(self, frame) -> bool:
@@ -240,6 +265,8 @@ class CameraMonitor(QtCore.QThread):
                 if name in {"cell phone", "phone", "mobile phone", "remote"}:
                     has_phone = True
 
+        if objects:
+            print(f"[调试] YOLO检测到的物体: {objects}")
         return has_phone
 
     def run(self) -> None:
@@ -250,10 +277,26 @@ class CameraMonitor(QtCore.QThread):
             return
         if self._yolo_missing:
             self.status.emit("未找到 YOLO11 权重，将仅按低头动作提醒。")
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            self.status.emit("无法打开摄像头。")
+
+        cap = None
+        search_order = [1, 0] if sys.platform == "darwin" else [0, 1]
+        used_index = -1
+        for idx in search_order:
+            temp_cap = cv2.VideoCapture(idx)
+            if temp_cap.isOpened():
+                ret, _ = temp_cap.read()
+                if ret:
+                    cap = temp_cap
+                    used_index = idx
+                    break
+                else:
+                    temp_cap.release()
+
+        if cap is None:
+            self.status.emit("无法打开摄像头(未找到可用设备)。")
             return
+
+        print(f"已启动摄像头 Index: {used_index}")
 
         last_frame_time = 0.0
         while not self._stop_flag.is_set():
@@ -274,6 +317,7 @@ class CameraMonitor(QtCore.QThread):
             face_landmarks = result.multi_face_landmarks[0]
             head_down = self._head_down(face_landmarks)
             phone = self._phone_detected(frame) if self._yolo else False
+
             if head_down or phone:
                 if now - self._last_prompt_time >= self._config.prompt_cooldown:
                     self._last_prompt_time = now
@@ -282,19 +326,25 @@ class CameraMonitor(QtCore.QThread):
         cap.release()
 
 
+# --- 主窗口 ---
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Focus Timer")
+        self.setWindowTitle("HeadsUp - 专注卫士")
+
         base_dir = os.path.dirname(os.path.abspath(__file__))
         icon_path = os.path.join(base_dir, "assets", "logo.png")
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
-        else:
-            print(f"警告: 未找到图标文件 {icon_path}")
-        self.setMinimumSize(600, 620)
+            app_icon = QIcon(icon_path)
+            QtWidgets.QApplication.setWindowIcon(app_icon)
+
+        self.setMinimumSize(600, 680)
         self._config = AppConfig()
+
         self._remaining = 0
+        self._is_break_mode = False
+
         self._timer = QtCore.QTimer(self)
         self._timer.timeout.connect(self._on_tick)
         self._floating = FloatingTimer()
@@ -311,47 +361,63 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.setSpacing(18)
         layout.setContentsMargins(28, 28, 28, 28)
 
-        title = QtWidgets.QLabel("专注计时器")
+        title = QtWidgets.QLabel("HeadsUp 专注卫士")
         title.setObjectName("title")
         subtitle = QtWidgets.QLabel("倒计时 + 低头玩手机提醒")
         subtitle.setObjectName("subtitle")
 
-        time_group = QtWidgets.QGroupBox("计时设置")
-        time_layout = QtWidgets.QFormLayout(time_group)
+        # --- 1. 计时设置 (换成 QGridLayout 解决挤压问题) ---
+        time_group = QtWidgets.QGroupBox("时间循环设置")
+        # 使用 Grid 布局替代 Form 布局，控制力更强
+        time_layout = QtWidgets.QGridLayout(time_group)
         time_layout.setHorizontalSpacing(18)
         time_layout.setVerticalSpacing(12)
-        time_layout.setLabelAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
-        self.minutes_input = SpinBoxWithButtons(
-            0, 240, self._config.minutes, " 分钟"
-        )
-        self.minutes_input.setFixedWidth(140)
-        self.seconds_input = SpinBoxWithButtons(
-            0, 59, self._config.seconds, " 秒"
-        )
-        self.seconds_input.setFixedWidth(140)
-        time_layout.addRow("计时", self.minutes_input)
-        time_layout.addRow("", self.seconds_input)
 
-        prompt_group = QtWidgets.QGroupBox("语音提示")
+        # 专注时长
+        self.focus_min_input = SpinBoxWithButtons(0, 240, self._config.focus_minutes, " 分钟")
+        self.focus_min_input.setFixedWidth(150)  # 设置整个容器宽度
+        self.focus_sec_input = SpinBoxWithButtons(0, 59, self._config.focus_seconds, " 秒")
+        self.focus_sec_input.setFixedWidth(150)
+
+        # 休息时长
+        self.break_min_input = SpinBoxWithButtons(0, 60, self._config.break_minutes, " 分钟")
+        self.break_min_input.setFixedWidth(150)
+        self.break_sec_input = SpinBoxWithButtons(0, 59, self._config.break_seconds, " 秒")
+        self.break_sec_input.setFixedWidth(150)
+
+        # 添加到网格: (Widget, Row, Col)
+        time_layout.addWidget(QtWidgets.QLabel("专注时长"), 0, 0)
+        time_layout.addWidget(self.focus_min_input, 0, 1)
+        time_layout.addWidget(self.focus_sec_input, 0, 2)
+
+        time_layout.addWidget(QtWidgets.QLabel("休息/玩手机"), 1, 0)
+        time_layout.addWidget(self.break_min_input, 1, 1)
+        time_layout.addWidget(self.break_sec_input, 1, 2)
+
+        # 弹簧，防止靠左太紧
+        time_layout.setColumnStretch(3, 1)
+
+        # --- 2. 语音设置 ---
+        prompt_group = QtWidgets.QGroupBox("监督提醒设置")
         prompt_layout = QtWidgets.QVBoxLayout(prompt_group)
         prompt_layout.setSpacing(10)
         self.prompt_input = QtWidgets.QLineEdit(self._config.prompt_text)
-        self.prompt_input.setPlaceholderText("输入提醒内容")
-        self.cooldown_input = SpinBoxWithButtons(
-            3, 120, self._config.prompt_cooldown, " 秒"
-        )
-        self.cooldown_input.setFixedWidth(140)
+        self.prompt_input.setPlaceholderText("输入专注时的提醒内容")
+        self.cooldown_input = SpinBoxWithButtons(3, 120, self._config.prompt_cooldown, " 秒")
+        self.cooldown_input.setFixedWidth(150)
         cooldown_layout = QtWidgets.QHBoxLayout()
         cooldown_layout.setSpacing(12)
-        cooldown_layout.addWidget(QtWidgets.QLabel("提醒冷却(秒)"))
+        cooldown_layout.addWidget(QtWidgets.QLabel("提醒冷却间隔"))
         cooldown_layout.addWidget(self.cooldown_input)
+        cooldown_layout.addStretch()  # 向左对齐
         prompt_layout.addWidget(self.prompt_input)
         prompt_layout.addLayout(cooldown_layout)
 
-        monitor_group = QtWidgets.QGroupBox("摄像头监测")
+        # --- 3. 监测设置 ---
+        monitor_group = QtWidgets.QGroupBox("摄像头监测 (仅专注时开启)")
         monitor_layout = QtWidgets.QVBoxLayout(monitor_group)
         monitor_layout.setSpacing(10)
-        self.monitor_checkbox = QtWidgets.QCheckBox("开始计时后启用监测")
+        self.monitor_checkbox = QtWidgets.QCheckBox("启用AI监测")
         self.monitor_checkbox.setChecked(self._config.enable_monitor)
         self.model_path = QtWidgets.QLineEdit(self._config.yolo_weights_path)
         self.model_path.setPlaceholderText("YOLO11 权重路径 (可选)")
@@ -367,7 +433,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.monitor_status.setObjectName("status")
         monitor_layout.addWidget(self.monitor_status)
 
-        self.start_button = QtWidgets.QPushButton("开始计时")
+        # --- 按钮 ---
+        self.start_button = QtWidgets.QPushButton("开始专注循环")
         self.start_button.clicked.connect(self._on_start)
         self.stop_button = QtWidgets.QPushButton("停止")
         self.stop_button.clicked.connect(self._on_stop)
@@ -436,20 +503,21 @@ class MainWindow(QtWidgets.QMainWindow):
                 font-weight: 700;
                 color: #8a5a3a;
             }}
-            QSpinBox::up-button, QSpinBox::down-button {{
+            QSpinBox::up-button {{
+                subcontrol-position: top right;
+                margin: 5px 4px 0 0;
                 width: 16px;
                 border-radius: 6px;
                 background-color: #ffe4d6;
                 border: 1px solid #f2b48f;
-                subcontrol-origin: padding;
-            }}
-            QSpinBox::up-button {{
-                subcontrol-position: top right;
-                margin: 5px 4px 0 0;
             }}
             QSpinBox::down-button {{
                 subcontrol-position: bottom right;
                 margin: 0 4px 5px 0;
+                width: 16px;
+                border-radius: 6px;
+                background-color: #ffe4d6;
+                border: 1px solid #f2b48f;
             }}
             QSpinBox::up-arrow, QSpinBox::down-arrow {{
                 width: 10px;
@@ -482,7 +550,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tray = QtWidgets.QSystemTrayIcon(self)
         icon = self.style().standardIcon(QtWidgets.QStyle.SP_ComputerIcon)
         self.tray.setIcon(icon)
-        self.tray.setToolTip("Focus Timer")
+        self.tray.setToolTip("HeadsUp")
 
         menu = QtWidgets.QMenu()
         action_show = menu.addAction("显示/隐藏")
@@ -508,43 +576,81 @@ class MainWindow(QtWidgets.QMainWindow):
             self.model_path.setText(path)
 
     def _on_start(self):
-        minutes = self.minutes_input.value()
-        seconds = self.seconds_input.value()
-        total = minutes * 60 + seconds
-        if total <= 0:
-            QtWidgets.QMessageBox.information(self, "提示", "请输入有效计时时长。")
-            return
+        self._config.focus_minutes = self.focus_min_input.value()
+        self._config.focus_seconds = self.focus_sec_input.value()
+        self._config.break_minutes = self.break_min_input.value()
+        self._config.break_seconds = self.break_sec_input.value()
 
-        self._config.minutes = minutes
-        self._config.seconds = seconds
         self._config.prompt_text = self.prompt_input.text().strip() or self._config.prompt_text
         self._config.prompt_cooldown = self.cooldown_input.value()
         self._config.enable_monitor = self.monitor_checkbox.isChecked()
         self._config.yolo_weights_path = self.model_path.text().strip()
 
-        self._remaining = total
-        self._update_countdown_label()
-        self._timer.start(1000)
-        self._floating.show()
+        focus_total = self._config.focus_minutes * 60 + self._config.focus_seconds
+        break_total = self._config.break_minutes * 60 + self._config.break_seconds
+        if focus_total <= 0:
+            QtWidgets.QMessageBox.information(self, "提示", "专注时长必须大于0。")
+            return
+        if break_total <= 0:
+            QtWidgets.QMessageBox.information(self, "提示", "休息时长必须大于0。")
+            return
+
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
+        self._floating.show()
+
+        self._start_focus_phase()
+        self._timer.start(1000)
+
+    def _start_focus_phase(self):
+        self._is_break_mode = False
+        total = self._config.focus_minutes * 60 + self._config.focus_seconds
+        self._remaining = total
+
+        self._update_countdown_label()
+
+        self._prompter.speak("专注开始，加油。")
+        self.monitor_status.setText("状态：专注中 (监测开启)")
 
         if self._config.enable_monitor:
             self._start_monitor()
+        else:
+            self.monitor_status.setText("状态：专注中 (监测未开启)")
+
+    def _start_break_phase(self):
+        self._is_break_mode = True
+        total = self._config.break_minutes * 60 + self._config.break_seconds
+        self._remaining = total
+
+        self._update_countdown_label()
+
+        self._prompter.speak("时间到，可以玩手机了。")
+        self.monitor_status.setText("状态：休息中 (监测暂停)")
+
+        self._stop_monitor()
 
     def _start_monitor(self):
-        self.monitor_status.setText("摄像头监测已启动")
+        if self._monitor is not None:
+            return
         self._monitor = CameraMonitor(self._config)
         self._monitor.prompt_needed.connect(self._on_prompt)
         self._monitor.status.connect(self._on_monitor_status)
         self._monitor.start()
+
+    def _stop_monitor(self):
+        if self._monitor:
+            self._monitor.stop()
+            self._monitor.wait(1500)
+            self._monitor = None
+        self.monitor_status.setText("摄像头监测已暂停")
 
     def _on_prompt(self, text: str):
         self._prompter.speak(text)
         QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), text)
 
     def _on_monitor_status(self, message: str):
-        self.monitor_status.setText(message)
+        if not self._is_break_mode:
+            self.monitor_status.setText(message)
 
     def _on_stop(self):
         self._timer.stop()
@@ -552,36 +658,31 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stop_monitor()
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
+        self.monitor_status.setText("")
 
     def _on_quit(self):
         self._on_stop()
         QtWidgets.QApplication.quit()
 
-    def _stop_monitor(self):
-        if self._monitor:
-            self._monitor.stop()
-            self._monitor.wait(1500)
-            self._monitor = None
-
     def _on_tick(self):
         self._remaining -= 1
+
         if self._remaining <= 0:
-            self._timer.stop()
-            self._floating.hide()
-            self._stop_monitor()
-            self.start_button.setEnabled(True)
-            self.stop_button.setEnabled(False)
-            end_text = "计时结束，可以玩手机了。"
-            self._prompter.speak(end_text)
-            QtWidgets.QMessageBox.information(self, "提示", end_text)
+            if not self._is_break_mode:
+                self._start_break_phase()
+            else:
+                self._start_focus_phase()
             return
+
         self._update_countdown_label()
 
     def _update_countdown_label(self):
         mins = self._remaining // 60
         secs = self._remaining % 60
         text = f"{mins:02d}:{secs:02d}"
-        self._floating.update_time(text)
+
+        status_text = "玩手机时间" if self._is_break_mode else "专注时间"
+        self._floating.update_time(text, status_text)
 
     def closeEvent(self, event):
         event.ignore()
