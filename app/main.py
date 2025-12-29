@@ -6,27 +6,30 @@ import signal
 from dataclasses import dataclass
 from pathlib import Path
 
-import cv2
+# --- 界面库 ---
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtGui import QIcon, QAction
 
-# --- 依赖库导入检查 ---
+# --- 视觉库导入 (带防崩溃处理) ---
+import cv2
+
 MP_IMPORT_ERROR = ""
 mp_face_mesh = None
 
 try:
+    # 【核心修复】 回归最标准的导入方式
+    # 只要完成了"第一步"的环境修复，这里就能正常工作
     import mediapipe as mp
-    from mediapipe.python.solutions import face_mesh as mp_face_mesh_solution
 
-    mp_face_mesh = mp_face_mesh_solution
-except Exception as exc:
-    try:
-        from mediapipe import solutions
-
-        mp_face_mesh = solutions.face_mesh
-    except Exception as exc2:
-        mp_face_mesh = None
-        MP_IMPORT_ERROR = str(exc)
+    if hasattr(mp, "solutions"):
+        mp_face_mesh = mp.solutions.face_mesh
+    else:
+        # 如果 import mediapipe 成功但没有 solutions，通常是 protobuf 版本不对
+        MP_IMPORT_ERROR = "MediaPipe加载不完整，请检查 protobuf 版本"
+except ImportError as e:
+    MP_IMPORT_ERROR = f"未安装 MediaPipe: {e}"
+except Exception as e:
+    MP_IMPORT_ERROR = f"MediaPipe 内部错误: {e}"
 
 try:
     from ultralytics import YOLO
@@ -59,7 +62,7 @@ class FloatingTimer(QtWidgets.QWidget):
         self.setWindowFlags(
             QtCore.Qt.FramelessWindowHint
             | QtCore.Qt.WindowStaysOnTopHint
-            | QtCore.Qt.Tool  # 使用 Tool 模式，不显示在任务栏
+            | QtCore.Qt.Tool
         )
         self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
         self.setFixedSize(240, 90)
@@ -215,7 +218,7 @@ class CameraMonitor(QtCore.QThread):
             except Exception as e:
                 self._mp_error = str(e)
         else:
-            self._mp_error = MP_IMPORT_ERROR or "mediapipe 未正确安装"
+            self._mp_error = MP_IMPORT_ERROR or "Mediapipe 加载失败"
 
         weights = Path(self._config.yolo_weights_path)
         if YOLO and weights.exists():
@@ -230,6 +233,7 @@ class CameraMonitor(QtCore.QThread):
         lm = landmarks.landmark
         nose = lm[1]
         chin = lm[152]
+        # 使用眼睛的平均高度
         eye_mid_y = (lm[33].y + lm[263].y) / 2.0
         denom = (chin.y - eye_mid_y)
         if denom <= 0: return False
@@ -250,11 +254,11 @@ class CameraMonitor(QtCore.QThread):
     def run(self) -> None:
         self._init_models()
         if not self._face_mesh:
-            self.status.emit(f"错误: {self._mp_error or 'MediaPipe 加载失败'}")
+            self.status.emit(f"错误: {self._mp_error}")
             return
 
         cap = None
-        # 尝试不同索引的摄像头
+        # 尝试摄像头索引
         for idx in ([1, 0] if sys.platform == "darwin" else [0, 1]):
             if self._stop_flag.is_set(): break
             temp = cv2.VideoCapture(idx)
@@ -287,12 +291,15 @@ class CameraMonitor(QtCore.QThread):
                 res = self._face_mesh.process(rgb)
 
                 trigger = False
+                # 1. 检测低头
                 if res.multi_face_landmarks:
                     if self._head_down(res.multi_face_landmarks[0]):
                         trigger = True
 
-                if not trigger and self._yolo and self._phone_detected(frame):
-                    trigger = True
+                # 2. 检测手机
+                if not trigger and self._yolo:
+                    if self._phone_detected(frame):
+                        trigger = True
 
                 if trigger:
                     if now - self._last_prompt_time >= self._config.prompt_cooldown:
@@ -310,7 +317,7 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("HeadsUp - 专注卫士")
 
-        # 处理 Ctrl+C
+        # 允许 Ctrl+C 强制结束
         signal.signal(signal.SIGINT, signal.SIG_DFL)
 
         # 标志位：是否强制退出
@@ -321,7 +328,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if os.path.exists(icon_path):
             self._app_icon = QIcon(icon_path)
         else:
-            # 如果没有图片，用系统默认图标
             self._app_icon = self.style().standardIcon(QtWidgets.QStyle.SP_ComputerIcon)
 
         self.setWindowIcon(self._app_icon)
@@ -341,25 +347,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._build_ui()
         self._apply_style()
-        self._init_tray()  # 初始化托盘
+        self._init_tray()
 
     def _init_tray(self):
-        """初始化系统托盘图标"""
         self.tray = QtWidgets.QSystemTrayIcon(self)
         self.tray.setIcon(self._app_icon)
         self.tray.setToolTip("HeadsUp 专注卫士")
 
-        # 创建右键菜单
         menu = QtWidgets.QMenu()
 
-        # 动作1: 显示主界面
         action_show = QAction("显示主界面", self)
         action_show.triggered.connect(self._show_window)
         menu.addAction(action_show)
 
         menu.addSeparator()
 
-        # 动作2: 彻底退出
         action_quit = QAction("退出程序", self)
         action_quit.triggered.connect(self._on_force_quit)
         menu.addAction(action_quit)
@@ -367,11 +369,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tray.setContextMenu(menu)
         self.tray.show()
 
-        # 左键点击托盘图标时的行为
         self.tray.activated.connect(self._on_tray_activated)
 
     def _on_tray_activated(self, reason):
-        # 双击或单击时显示窗口
         if reason == QtWidgets.QSystemTrayIcon.Trigger or reason == QtWidgets.QSystemTrayIcon.DoubleClick:
             self._show_window()
 
@@ -381,20 +381,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.activateWindow()
 
     def _on_force_quit(self):
-        """用户点击了托盘菜单的退出，设置为强制退出模式"""
         self._force_quit = True
-        self.close()  # 这会触发 closeEvent
+        self.close()
 
     def closeEvent(self, event):
-        """拦截窗口关闭事件"""
         if self._force_quit:
-            # 如果是右键托盘退出，真正关闭
             self._stop_monitor_cleanly()
             self._timer.stop()
             self.tray.hide()
             event.accept()
         else:
-            # 否则只是隐藏窗口，最小化到托盘
             event.ignore()
             self.hide()
             self.tray.showMessage(
@@ -410,7 +406,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._monitor.wait(1000)
             self._monitor = None
 
-    # --- UI 构建代码 ---
     def _build_ui(self):
         widget = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(widget)
@@ -423,7 +418,6 @@ class MainWindow(QtWidgets.QMainWindow):
         subtitle.setObjectName("subtitle")
         subtitle.setWordWrap(True)
 
-        # 时间设置
         time_group = QtWidgets.QGroupBox("时间循环设置")
         time_layout = QtWidgets.QGridLayout(time_group)
         time_layout.setHorizontalSpacing(18)
@@ -446,7 +440,6 @@ class MainWindow(QtWidgets.QMainWindow):
         time_layout.addWidget(self.break_sec_input, 1, 2)
         time_layout.setColumnStretch(3, 1)
 
-        # 提醒设置
         prompt_group = QtWidgets.QGroupBox("提醒设置")
         prompt_layout = QtWidgets.QVBoxLayout(prompt_group)
         self.prompt_input = QtWidgets.QLineEdit(self._config.prompt_text)
@@ -459,7 +452,6 @@ class MainWindow(QtWidgets.QMainWindow):
         prompt_layout.addWidget(self.prompt_input)
         prompt_layout.addLayout(row)
 
-        # 监测设置
         monitor_group = QtWidgets.QGroupBox("摄像头设置")
         monitor_layout = QtWidgets.QVBoxLayout(monitor_group)
         self.monitor_checkbox = QtWidgets.QCheckBox("启用监测")
@@ -477,7 +469,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.monitor_status.setObjectName("status")
         monitor_layout.addWidget(self.monitor_status)
 
-        # 按钮
         self.start_button = QtWidgets.QPushButton("开始")
         self.start_button.clicked.connect(self._on_start)
         self.stop_button = QtWidgets.QPushButton("停止")
@@ -574,9 +565,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
 if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
-    app.setQuitOnLastWindowClosed(False)  # 关键：关闭最后一个窗口时不退出程序
+    app.setQuitOnLastWindowClosed(False)
 
-    # 这一行保证 Ctrl+C 可以杀死程序
     timer = QtCore.QTimer()
     timer.timeout.connect(lambda: None)
     timer.start(200)
