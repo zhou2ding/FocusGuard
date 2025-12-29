@@ -1,7 +1,8 @@
 import sys
-import platform, os
+import os
 import time
 import threading
+import queue
 import signal
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,10 +51,10 @@ class AppConfig:
     prompt_cooldown: int = 8
     enable_monitor: bool = True
     yolo_weights_path: str = "models/yolo11n.pt"
-    camera_index: int = 0  # 新增：选定的摄像头索引
+    camera_index: int = 0
 
 
-# --- 悬浮窗组件 (保持不变) ---
+# --- 悬浮窗组件 (保持 UI 风格) ---
 class FloatingTimer(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
@@ -111,33 +112,52 @@ class FloatingTimer(QtWidgets.QWidget):
         event.accept()
 
 
-# --- 语音组件 ---
+# --- 语音组件 (Windows 专用队列修复版) ---
 class VoicePrompter(QtCore.QObject):
+    """
+    使用队列(Queue)机制修复 Windows 下 pyttsx3 频繁调用导致的卡死/无声问题
+    """
+
     def __init__(self):
         super().__init__()
-        self._engine = None
-        if platform.system() == "Windows":
-            if pyttsx3:
-                try:
-                    self._engine = pyttsx3.init()
-                except Exception:
-                    self._engine = None
+        self._queue = queue.Queue()
+        # 启动一个守护线程专门负责说话
+        self._thread = threading.Thread(target=self._speech_loop, daemon=True)
+        self._thread.start()
 
     def speak(self, text: str) -> None:
-        print(f"[语音播报] {text}")
-        if platform.system() == "Darwin":
-            os.system(f'say "{text}" &')
-            return
+        print(f"[语音指令] 加入队列: {text}")
+        self._queue.put(text)
 
-        if self._engine:
-            def _worker():
+    def _speech_loop(self):
+        # 在线程内部初始化引擎，确保 COM 环境安全
+        engine = None
+        try:
+            if pyttsx3:
+                engine = pyttsx3.init()
+                # 可以微调语速
+                engine.setProperty('rate', 150)
+        except Exception as e:
+            print(f"[语音错误] 引擎初始化失败: {e}")
+
+        while True:
+            # 阻塞等待，直到有新文本进来
+            text = self._queue.get()
+            if text is None: break  # 退出信号
+
+            if engine:
                 try:
-                    self._engine.say(text)
-                    self._engine.runAndWait()
-                except:
-                    pass
-
-            threading.Thread(target=_worker, daemon=True).start()
+                    engine.say(text)
+                    engine.runAndWait()
+                except Exception as e:
+                    print(f"[语音错误] 播放失败: {e}")
+                    # 如果引擎挂了，尝试重建
+                    try:
+                        engine = pyttsx3.init()
+                    except:
+                        pass
+            else:
+                print(f"[语音模拟] {text}")
 
 
 # --- 自定义输入框 ---
@@ -178,7 +198,7 @@ class SpinBoxWithButtons(QtWidgets.QWidget):
     def setValue(self, value: int) -> None: self.spin.setValue(value)
 
 
-# --- 监测线程 ---
+# --- 监测线程 (Windows 纯净版) ---
 class CameraMonitor(QtCore.QThread):
     prompt_needed = QtCore.Signal(str)
     status = QtCore.Signal(str)
@@ -245,7 +265,7 @@ class CameraMonitor(QtCore.QThread):
             self.status.emit(f"错误: {self._mp_error}")
             return
 
-        # 使用用户选定的摄像头索引
+        # 移除了所有 Mac 逻辑，直接使用 camera_index
         cap = cv2.VideoCapture(self._config.camera_index)
         if not cap.isOpened():
             self.status.emit(f"无法打开摄像头 {self._config.camera_index}")
@@ -261,7 +281,7 @@ class CameraMonitor(QtCore.QThread):
                 continue
 
             now = time.time()
-            if now - last_frame_time < 0.2:  # 限制处理频率
+            if now - last_frame_time < 0.2:  # 限制FPS，减少资源占用
                 continue
             last_frame_time = now
 
@@ -300,10 +320,9 @@ class CameraMonitor(QtCore.QThread):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("HeadsUp - 专注卫士 (摄像头校验版)")
+        self.setWindowTitle("HeadsUp - 专注卫士 (Windows版)")
         signal.signal(signal.SIGINT, signal.SIG_DFL)
 
-        # 资源初始化
         base_dir = os.path.dirname(os.path.abspath(__file__))
         icon_path = os.path.join(base_dir, "assets", "logo.png")
         if os.path.exists(icon_path):
@@ -311,7 +330,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.setWindowIcon(self._app_icon)
             QtWidgets.QApplication.setWindowIcon(self._app_icon)
 
-        self.setMinimumSize(600, 750)
+        self.setMinimumSize(600, 800)  # 稍微增加高度以容纳新组件
         self._config = AppConfig()
 
         self._remaining = 0
@@ -323,26 +342,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self._monitor = None
         self._prompter = VoicePrompter()
 
-        # 预览相关的变量
         self._preview_timer = QtCore.QTimer(self)
         self._preview_timer.timeout.connect(self._update_preview)
         self._preview_cap = None
         self._is_previewing = False
-        self._camera_verified = False  # 只有验证通过才能开始
+        self._camera_verified = False
 
         self._build_ui()
         self._apply_style()
         self._init_tray()
 
-        # 启动时自动扫描摄像头
         self._scan_cameras()
 
     def _scan_cameras(self):
-        """扫描前3个摄像头索引"""
         self.camera_combo.clear()
         found = False
+        # Windows下扫描 0 到 2 即可
         for i in range(3):
-            # 快速尝试打开
             temp = cv2.VideoCapture(i)
             if temp.isOpened():
                 ret, _ = temp.read()
@@ -358,14 +374,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.camera_combo.setCurrentIndex(0)
 
     def _toggle_preview(self):
-        """切换预览状态"""
         if self._is_previewing:
-            # 停止预览
             self._stop_preview()
             self.preview_btn.setText("测试/预览摄像头")
-            # 如果之前验证通过了，保持 Start 按钮可用
         else:
-            # 开始预览
             idx = self.camera_combo.currentData()
             if idx is None or idx < 0:
                 QtWidgets.QMessageBox.warning(self, "错误", "没有可用的摄像头")
@@ -374,11 +386,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._preview_cap = cv2.VideoCapture(idx)
             if self._preview_cap.isOpened():
                 self._is_previewing = True
-                self._preview_timer.start(30)  # 30ms 一帧
+                self._preview_timer.start(30)
                 self.preview_btn.setText("停止预览")
                 self.monitor_status.setText("正在预览画面...")
 
-                # 只要能成功开启预览，就认为验证通过，允许开始专注
                 self._camera_verified = True
                 self.start_button.setEnabled(True)
                 self.start_button.setText("开始专注循环")
@@ -392,17 +403,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.critical(self, "错误", "无法打开该摄像头，请选择其他设备。")
 
     def _update_preview(self):
-        """刷新预览画面"""
         if self._preview_cap and self._preview_cap.isOpened():
             ret, frame = self._preview_cap.read()
             if ret:
-                # 转为 Qt 格式显示
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 h, w, ch = frame.shape
                 bytes_per_line = ch * w
                 qt_img = QImage(frame.data, w, h, bytes_per_line, QImage.Format_RGB888)
-
-                # 缩放以适应 Label
                 pixmap = QPixmap.fromImage(qt_img).scaled(
                     self.preview_label.size(),
                     QtCore.Qt.KeepAspectRatio,
@@ -413,7 +420,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.monitor_status.setText("摄像头读取失败")
 
     def _stop_preview(self):
-        """停止预览并释放资源"""
         self._preview_timer.stop()
         if self._preview_cap:
             self._preview_cap.release()
@@ -422,25 +428,32 @@ class MainWindow(QtWidgets.QMainWindow):
         self.preview_label.clear()
         self.preview_label.setText("摄像头预览区\n(请点击下方按钮测试)")
 
+    def _browse_weights(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "选择模型", "", "Model (*.pt)"
+        )
+        if path:
+            self.model_path_input.setText(path)
+
     def _on_start(self):
-        # 1. 如果正在预览，必须先关闭预览释放摄像头
         if self._is_previewing:
             self._stop_preview()
             self.preview_btn.setText("测试/预览摄像头")
 
-        # 2. 获取配置
         self._config.focus_minutes = self.focus_min_input.value()
         self._config.focus_seconds = self.focus_sec_input.value()
         self._config.break_minutes = self.break_min_input.value()
         self._config.break_seconds = self.break_sec_input.value()
         self._config.prompt_text = self.prompt_input.text()
         self._config.camera_index = self.camera_combo.currentData()
+        self._config.yolo_weights_path = self.model_path_input.text().strip()
 
-        # 3. UI 状态切换
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
-        self.preview_btn.setEnabled(False)  # 专注过程中禁止乱动摄像头
+        self.preview_btn.setEnabled(False)
         self.camera_combo.setEnabled(False)
+        self.model_path_input.setEnabled(False)
+        self.browse_btn.setEnabled(False)
 
         self._floating.show()
         self._start_focus_phase()
@@ -455,17 +468,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stop_button.setEnabled(False)
         self.preview_btn.setEnabled(True)
         self.camera_combo.setEnabled(True)
+        self.model_path_input.setEnabled(True)
+        self.browse_btn.setEnabled(True)
 
         self.monitor_status.setText("已停止")
 
-    # --- 剩余逻辑与之前保持一致 ---
     def _start_focus_phase(self):
         self._is_break_mode = False
         self._remaining = self._config.focus_minutes * 60 + self._config.focus_seconds
         self._update_countdown_label()
         self._prompter.speak("开始专注")
 
-        # 启动 AI 监测线程
         if self._config.enable_monitor:
             self._monitor = CameraMonitor(self._config)
             self._monitor.prompt_needed.connect(lambda t: self._prompter.speak(t))
@@ -550,37 +563,46 @@ class MainWindow(QtWidgets.QMainWindow):
         title = QtWidgets.QLabel("HeadsUp 专注卫士")
         title.setObjectName("title")
 
-        # --- 1. 摄像头选择与预览区 (核心修改) ---
-        cam_group = QtWidgets.QGroupBox("摄像头检查 (必须完成)")
+        # --- 1. 设备设置 ---
+        cam_group = QtWidgets.QGroupBox("1. 硬件检查 (必须完成)")
         cam_layout = QtWidgets.QVBoxLayout(cam_group)
 
-        # 选择框
         self.camera_combo = QtWidgets.QComboBox()
         self.camera_combo.setMinimumHeight(35)
 
-        # 预览窗口 (Label)
         self.preview_label = QtWidgets.QLabel("摄像头预览区\n(请点击下方按钮测试)")
-        self.preview_label.setFixedSize(320, 240)  # 4:3 比例
+        self.preview_label.setFixedSize(320, 240)
         self.preview_label.setStyleSheet("background-color: #333; color: #fff; border-radius: 5px;")
         self.preview_label.setAlignment(QtCore.Qt.AlignCenter)
 
-        # 预览按钮
         self.preview_btn = QtWidgets.QPushButton("测试/预览摄像头")
         self.preview_btn.clicked.connect(self._toggle_preview)
 
-        # 居中放置预览区
         preview_container = QtWidgets.QHBoxLayout()
         preview_container.addStretch()
         preview_container.addWidget(self.preview_label)
         preview_container.addStretch()
 
-        cam_layout.addWidget(QtWidgets.QLabel("选择设备:"))
+        # 【恢复模型选择】
+        model_layout = QtWidgets.QHBoxLayout()
+        self.model_path_input = QtWidgets.QLineEdit(self._config.yolo_weights_path)
+        self.model_path_input.setPlaceholderText("YOLO模型路径 (.pt)")
+        self.browse_btn = QtWidgets.QPushButton("...")
+        self.browse_btn.setFixedWidth(40)
+        self.browse_btn.clicked.connect(self._browse_weights)
+        model_layout.addWidget(QtWidgets.QLabel("模型:"))
+        model_layout.addWidget(self.model_path_input)
+        model_layout.addWidget(self.browse_btn)
+
+        cam_layout.addWidget(QtWidgets.QLabel("选择摄像头:"))
         cam_layout.addWidget(self.camera_combo)
         cam_layout.addLayout(preview_container)
         cam_layout.addWidget(self.preview_btn)
+        cam_layout.addSpacing(10)
+        cam_layout.addLayout(model_layout)
 
         # --- 2. 时间设置 ---
-        time_group = QtWidgets.QGroupBox("时间设置")
+        time_group = QtWidgets.QGroupBox("2. 专注计划")
         time_layout = QtWidgets.QGridLayout(time_group)
         self.focus_min_input = SpinBoxWithButtons(0, 240, self._config.focus_minutes, " 分")
         self.focus_sec_input = SpinBoxWithButtons(0, 59, self._config.focus_seconds, " 秒")
@@ -593,8 +615,8 @@ class MainWindow(QtWidgets.QMainWindow):
         time_layout.addWidget(self.break_min_input, 1, 1)
         time_layout.addWidget(self.break_sec_input, 1, 2)
 
-        # --- 3. 提醒与控制 ---
-        prompt_group = QtWidgets.QGroupBox("提醒内容")
+        # --- 3. 提醒 ---
+        prompt_group = QtWidgets.QGroupBox("3. 提醒内容")
         prompt_layout = QtWidgets.QVBoxLayout(prompt_group)
         self.prompt_input = QtWidgets.QLineEdit(self._config.prompt_text)
         prompt_layout.addWidget(self.prompt_input)
@@ -602,9 +624,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.monitor_status = QtWidgets.QLabel("等待摄像头检测...")
         self.monitor_status.setObjectName("status")
 
-        # 按钮区
         self.start_button = QtWidgets.QPushButton("请先测试摄像头")
-        self.start_button.setEnabled(False)  # 默认禁用！
+        self.start_button.setEnabled(False)
         self.start_button.setStyleSheet("background-color: #cccccc; color: #666;")
         self.start_button.clicked.connect(self._on_start)
 
@@ -623,7 +644,6 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.monitor_status)
         layout.addLayout(btn_row)
 
-        # 滚动区域防止窗口太高显示不全
         scroll = QtWidgets.QScrollArea()
         scroll.setWidget(widget)
         scroll.setWidgetResizable(True)
