@@ -11,6 +11,17 @@ from pathlib import Path
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtGui import QIcon, QAction, QImage, QPixmap
 
+
+# --- 屏蔽烦人的 Qt 日志 ---
+def qt_message_handler(mode, context, message):
+    if "QFont::setPointSize" in message:
+        return  # 忽略这条特定的日志
+    # 打印其他日志 (可选)
+    # print(f"[Qt Log] {message}")
+
+
+QtCore.qInstallMessageHandler(qt_message_handler)
+
 # --- 视觉库 ---
 import cv2
 
@@ -54,7 +65,7 @@ class AppConfig:
     camera_index: int = 0
 
 
-# --- 悬浮窗组件 (保持 UI 风格) ---
+# --- 悬浮窗组件 ---
 class FloatingTimer(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
@@ -112,16 +123,11 @@ class FloatingTimer(QtWidgets.QWidget):
         event.accept()
 
 
-# --- 语音组件 (Windows 专用队列修复版) ---
+# --- 语音组件 (暴力重置版) ---
 class VoicePrompter(QtCore.QObject):
-    """
-    使用队列(Queue)机制修复 Windows 下 pyttsx3 频繁调用导致的卡死/无声问题
-    """
-
     def __init__(self):
         super().__init__()
         self._queue = queue.Queue()
-        # 启动一个守护线程专门负责说话
         self._thread = threading.Thread(target=self._speech_loop, daemon=True)
         self._thread.start()
 
@@ -130,32 +136,23 @@ class VoicePrompter(QtCore.QObject):
         self._queue.put(text)
 
     def _speech_loop(self):
-        # 在线程内部初始化引擎，确保 COM 环境安全
-        engine = None
-        try:
-            if pyttsx3:
-                engine = pyttsx3.init()
-                # 可以微调语速
-                engine.setProperty('rate', 150)
-        except Exception as e:
-            print(f"[语音错误] 引擎初始化失败: {e}")
-
         while True:
-            # 阻塞等待，直到有新文本进来
             text = self._queue.get()
-            if text is None: break  # 退出信号
+            if text is None: break
 
-            if engine:
+            # 【核心修改】每次说话都重新初始化引擎
+            # 这样可以避免上一句的 COM 对象死锁影响下一句
+            if pyttsx3:
                 try:
+                    engine = pyttsx3.init()
+                    engine.setProperty('rate', 150)
                     engine.say(text)
                     engine.runAndWait()
+                    # 显式停止，释放资源
+                    engine.stop()
+                    del engine
                 except Exception as e:
                     print(f"[语音错误] 播放失败: {e}")
-                    # 如果引擎挂了，尝试重建
-                    try:
-                        engine = pyttsx3.init()
-                    except:
-                        pass
             else:
                 print(f"[语音模拟] {text}")
 
@@ -198,7 +195,7 @@ class SpinBoxWithButtons(QtWidgets.QWidget):
     def setValue(self, value: int) -> None: self.spin.setValue(value)
 
 
-# --- 监测线程 (Windows 纯净版) ---
+# --- 监测线程 ---
 class CameraMonitor(QtCore.QThread):
     prompt_needed = QtCore.Signal(str)
     status = QtCore.Signal(str)
@@ -265,7 +262,6 @@ class CameraMonitor(QtCore.QThread):
             self.status.emit(f"错误: {self._mp_error}")
             return
 
-        # 移除了所有 Mac 逻辑，直接使用 camera_index
         cap = cv2.VideoCapture(self._config.camera_index)
         if not cap.isOpened():
             self.status.emit(f"无法打开摄像头 {self._config.camera_index}")
@@ -281,7 +277,7 @@ class CameraMonitor(QtCore.QThread):
                 continue
 
             now = time.time()
-            if now - last_frame_time < 0.2:  # 限制FPS，减少资源占用
+            if now - last_frame_time < 0.2:
                 continue
             last_frame_time = now
 
@@ -320,7 +316,7 @@ class CameraMonitor(QtCore.QThread):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("HeadsUp - 专注卫士 (Windows版)")
+        self.setWindowTitle("HeadsUp - 专注卫士")
         signal.signal(signal.SIGINT, signal.SIG_DFL)
 
         base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -330,7 +326,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.setWindowIcon(self._app_icon)
             QtWidgets.QApplication.setWindowIcon(self._app_icon)
 
-        self.setMinimumSize(600, 800)  # 稍微增加高度以容纳新组件
+        self.setMinimumSize(600, 800)
         self._config = AppConfig()
 
         self._remaining = 0
@@ -357,7 +353,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _scan_cameras(self):
         self.camera_combo.clear()
         found = False
-        # Windows下扫描 0 到 2 即可
         for i in range(3):
             temp = cv2.VideoCapture(i)
             if temp.isOpened():
@@ -583,7 +578,6 @@ class MainWindow(QtWidgets.QMainWindow):
         preview_container.addWidget(self.preview_label)
         preview_container.addStretch()
 
-        # 【恢复模型选择】
         model_layout = QtWidgets.QHBoxLayout()
         self.model_path_input = QtWidgets.QLineEdit(self._config.yolo_weights_path)
         self.model_path_input.setPlaceholderText("YOLO模型路径 (.pt)")
