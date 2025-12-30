@@ -13,7 +13,7 @@
 python -m venv .venv
 source .venv/bin/activate  # Windows 使用 .venv\Scripts\activate
 pip install -r requirements.txt
-python app/main.py
+python main.py
 ```
 
 macOS 说明：
@@ -31,7 +31,7 @@ macOS 说明：
 ## 打包 Windows 可执行文件（在 Windows 上执行）
 ```bash
 pip install pyinstaller
-pyinstaller --noconsole --onefile --name FocusTimer app/main.py
+pyinstaller -w -F --name GYJFocusGuard --add-data "assets/logo.png;assets" --icon="assets/logo.png" --collect-all ultralytics main.py
 ```
 
 如果项目较大，也可以在 Windows 上使用 NSIS/Inno Setup 制作安装包。
